@@ -67,70 +67,11 @@ ts_run_timeout() {
 	return "$rc"
 }
 
-# ---- 更新窗口内存让路：临时停掉占内存较大的服务，退出时（含异常）自动恢复 ----
-TS_RELIEF_STOPPED=''
-TS_RELIEF_ARMED=''
-
-ts_svc_running() {
-	local n="$1"
-	[ -x "/etc/init.d/$n" ] || return 1
-	if /etc/init.d/"$n" running >/dev/null 2>&1; then return 0; fi
-	pgrep -x "$n" >/dev/null 2>&1 && return 0
-	return 1
-}
-
-ts_relief_restore() {
-	local n avail waited calm
-	[ -n "$TS_RELIEF_STOPPED" ] || return 0
-	# 1) 等出足够空窗（此时 tailscaled 已停，门槛 40MB 很宽松）
-	waited=0
-	while [ "$waited" -lt 60 ]; do
-		ts_drop_caches
-		avail="$(ts_mem_avail_kb)"
-		if [ -n "$avail" ] && [ "$avail" -ge 40960 ]; then break; fi
-		sleep 5
-		waited=$((waited + 5))
-	done
-	# 2) 逐个拉起，中间留间隔
-	for n in $TS_RELIEF_STOPPED; do
-		/etc/init.d/"$n" start >/dev/null 2>&1
-		sleep 8
-		ts_drop_caches
-	done
-	# 3) 等冷启动尖峰过去：连续 3 次采样（15 秒）内存都不低于 30MB 才算稳定
-	waited=0
-	calm=0
-	while [ "$waited" -lt 120 ]; do
-		avail="$(ts_mem_avail_kb)"
-		if [ -n "$avail" ] && [ "$avail" -ge 51200 ]; then
-			calm=$((calm + 1))
-			[ "$calm" -ge 3 ] && break
-		else
-			calm=0
-		fi
-		sleep 5
-		waited=$((waited + 5))
-	done
-	TS_RELIEF_STOPPED=''
-}
-
-ts_relief_stop() {
-	# 默认完全不碰任何外部服务：pause_services 仅在显式配置时生效。
-	# 本设备上 mihomo/mosdns/nikki 与 tailscale 无关，更新期间必须保持运行；
-	# 如某台低内存设备确需让路，可 uci set tailscale.update.pause_services='mihomo'
-	local names n stopped
-	names="$(ts_uci_get update pause_services '')"
-	[ -n "$names" ] || return 0
-	stopped=''
-	for n in $names; do
-		ts_svc_running "$n" || continue
-		/etc/init.d/"$n" stop >/dev/null 2>&1 && stopped="$stopped $n"
-	done
-	TS_RELIEF_STOPPED="$stopped"
-	if [ -n "$stopped" ]; then
-		ts_drop_caches
-	fi
-}
+# 更新期间不暂停任何外部服务（mihomo/mosdns 等与 tailscale 更新无关，
+# 停掉它们反而造成断网）。内存保护由两个机制承担：
+#   1) rpcd 侧 refreshBlocked()：更新静默窗内与 MemAvailable<50MB 时不触发刷新
+#   2) 本脚本自身的等待/收敛逻辑（内存空窗、单实例、丢 page cache）
+# 如某台设备确需在更新期间让路，请在本地自行扩展，本脚本不再内置该行为。
 
 # 退出兜底：更新脚本被打断（HUP/TERM/异常）时，若更新前服务是运行状态，
 # 必须把它拉起来，避免"更新失败 → 服务一直停着"的次生故障。
@@ -147,7 +88,6 @@ ts_guard_arm() {
 ts_guard_exit() {
 	trap - EXIT INT TERM HUP
 	rm -f "$(ts_tmpdir)/quiet" 2>/dev/null
-	ts_relief_restore
 	if [ "${TS_GUARD_ARMED:-0}" = "1" ] && [ "${TS_GUARD_WAS:-0}" = "1" ]; then
 		if ! ts_running; then
 			TS_STOP_KEEP_CONFIG=1 "${TS_GUARD_INIT}" start >/dev/null 2>&1
@@ -155,21 +95,8 @@ ts_guard_exit() {
 	fi
 }
 
-ts_relief_arm() {
-	[ -n "$TS_RELIEF_ARMED" ] && return 0
-	TS_RELIEF_ARMED=1
+ts_guard_trap_install() {
 	trap 'ts_guard_exit' EXIT INT TERM HUP
-	# 按需让路：仅当内存低于 pause_min_kb（默认 45MB）且显式配置了
-	# pause_services 列表时才会暂停服务；默认列表为空，任何外部服务都不碰。
-	local floor avail
-	floor="$(ts_uci_get update pause_min_kb '45000')"
-	avail="$(ts_mem_avail_kb)"
-	case "$floor" in ''|*[!0-9]*) floor=45000 ;; esac
-	case "$avail" in ''|*[!0-9]*) avail=0 ;; esac
-	if [ "$avail" -ge "$floor" ]; then
-		return 0
-	fi
-	ts_relief_stop
 }
 
 # 只保留一个 tailscaled：重启竞态会留下多个实例（每个约 43MB），在 242MB 设备上直接致命
@@ -1520,7 +1447,7 @@ core_install() {
 		expected_version=''
 	fi
 	ts_guard_arm "$init" "$was_running"
-	ts_relief_arm
+	ts_guard_trap_install
 	if [ "$was_running" = "1" ]; then
 		ts_task_step "$id" stop 92 ""
 	fi
@@ -1558,9 +1485,6 @@ core_install() {
 		return 1
 	fi
 	ts_task_step "$id" install 95 ""
-	if [ -n "$TS_RELIEF_STOPPED" ]; then
-		ts_relief_restore
-	fi
 	if [ "$was_running" = "1" ]; then
 		ts_task_step "$id" restart 97 ""
 		socket="$(ts_uci_get main socket "$TS_DEF_SOCKET")"
