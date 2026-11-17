@@ -52,6 +52,219 @@ ts_tmpdir() {
 	printf '%s' "$dir"
 }
 
+# BusyBox 可能没有 timeout applet，这里用看门狗子进程模拟，防止 CLI 挂死堆积
+ts_run_timeout() {
+	local secs="$1" pid killer rc
+	shift
+	"$@" &
+	pid=$!
+	( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+	killer=$!
+	wait "$pid" 2>/dev/null
+	rc=$?
+	kill -9 "$killer" 2>/dev/null
+	wait "$killer" 2>/dev/null
+	return "$rc"
+}
+
+# ---- 更新窗口内存让路：临时停掉占内存较大的服务，退出时（含异常）自动恢复 ----
+TS_RELIEF_STOPPED=''
+TS_RELIEF_ARMED=''
+
+ts_svc_running() {
+	local n="$1"
+	[ -x "/etc/init.d/$n" ] || return 1
+	if /etc/init.d/"$n" running >/dev/null 2>&1; then return 0; fi
+	pgrep -x "$n" >/dev/null 2>&1 && return 0
+	return 1
+}
+
+ts_relief_restore() {
+	local n avail waited calm
+	[ -n "$TS_RELIEF_STOPPED" ] || return 0
+	# 1) 等出足够空窗（此时 tailscaled 已停，门槛 40MB 很宽松）
+	waited=0
+	while [ "$waited" -lt 60 ]; do
+		ts_drop_caches
+		avail="$(ts_mem_avail_kb)"
+		if [ -n "$avail" ] && [ "$avail" -ge 40960 ]; then break; fi
+		sleep 5
+		waited=$((waited + 5))
+	done
+	# 2) 逐个拉起，中间留间隔
+	for n in $TS_RELIEF_STOPPED; do
+		/etc/init.d/"$n" start >/dev/null 2>&1
+		sleep 8
+		ts_drop_caches
+	done
+	# 3) 等冷启动尖峰过去：连续 3 次采样（15 秒）内存都不低于 30MB 才算稳定
+	waited=0
+	calm=0
+	while [ "$waited" -lt 120 ]; do
+		avail="$(ts_mem_avail_kb)"
+		if [ -n "$avail" ] && [ "$avail" -ge 51200 ]; then
+			calm=$((calm + 1))
+			[ "$calm" -ge 3 ] && break
+		else
+			calm=0
+		fi
+		sleep 5
+		waited=$((waited + 5))
+	done
+	TS_RELIEF_STOPPED=''
+}
+
+ts_relief_stop() {
+	# 默认完全不碰任何外部服务：pause_services 仅在显式配置时生效。
+	# 本设备上 mihomo/mosdns/nikki 与 tailscale 无关，更新期间必须保持运行；
+	# 如某台低内存设备确需让路，可 uci set tailscale.update.pause_services='mihomo'
+	local names n stopped
+	names="$(ts_uci_get update pause_services '')"
+	[ -n "$names" ] || return 0
+	stopped=''
+	for n in $names; do
+		ts_svc_running "$n" || continue
+		/etc/init.d/"$n" stop >/dev/null 2>&1 && stopped="$stopped $n"
+	done
+	TS_RELIEF_STOPPED="$stopped"
+	if [ -n "$stopped" ]; then
+		ts_drop_caches
+	fi
+}
+
+# 退出兜底：更新脚本被打断（HUP/TERM/异常）时，若更新前服务是运行状态，
+# 必须把它拉起来，避免"更新失败 → 服务一直停着"的次生故障。
+TS_GUARD_ARMED=''
+TS_GUARD_WAS=''
+TS_GUARD_INIT=''
+
+ts_guard_arm() {
+	TS_GUARD_INIT="$1"
+	TS_GUARD_WAS="$2"
+	TS_GUARD_ARMED=1
+}
+
+ts_guard_exit() {
+	trap - EXIT INT TERM HUP
+	rm -f "$(ts_tmpdir)/quiet" 2>/dev/null
+	ts_relief_restore
+	if [ "${TS_GUARD_ARMED:-0}" = "1" ] && [ "${TS_GUARD_WAS:-0}" = "1" ]; then
+		if ! ts_running; then
+			TS_STOP_KEEP_CONFIG=1 "${TS_GUARD_INIT}" start >/dev/null 2>&1
+		fi
+	fi
+}
+
+ts_relief_arm() {
+	[ -n "$TS_RELIEF_ARMED" ] && return 0
+	TS_RELIEF_ARMED=1
+	trap 'ts_guard_exit' EXIT INT TERM HUP
+	# 按需让路：仅当内存低于 pause_min_kb（默认 45MB）且显式配置了
+	# pause_services 列表时才会暂停服务；默认列表为空，任何外部服务都不碰。
+	local floor avail
+	floor="$(ts_uci_get update pause_min_kb '45000')"
+	avail="$(ts_mem_avail_kb)"
+	case "$floor" in ''|*[!0-9]*) floor=45000 ;; esac
+	case "$avail" in ''|*[!0-9]*) avail=0 ;; esac
+	if [ "$avail" -ge "$floor" ]; then
+		return 0
+	fi
+	ts_relief_stop
+}
+
+# 只保留一个 tailscaled：重启竞态会留下多个实例（每个约 43MB），在 242MB 设备上直接致命
+ts_single_daemon() {
+	local pids keep p n
+	pids="$(pidof tailscaled 2>/dev/null)"
+	[ -n "$pids" ] || return 0
+	n=0
+	for p in $pids; do n=$((n + 1)); done
+	[ "$n" -le 1 ] && return 0
+	keep="$(printf '%s\n' $pids | sort -n | tail -n 1)"
+	for p in $pids; do
+		[ "$p" = "$keep" ] && continue
+		kill -9 "$p" 2>/dev/null
+	done
+	return 0
+}
+
+# 重启前清场：杀掉残留 wrapper 与所有 tailscaled，避免 procd 与脚本竞态形成双实例
+# 重启服务：前台执行并在返回前收敛到单实例。
+# 绝不 kill 由 procd 管理的进程——SIGKILL 会被 procd 判为崩溃并 respawn，
+# 与脚本自身的 restart 形成竞态，最终导致守护进程成批堆积（实测 12+ 实例 / load 70）。
+# `pidof tailscaled` 会把 CLI 也统计进来（/usr/sbin/tailscale 是指向 tailscaled 的软链接，
+# 进程名同为 tailscaled），必须按 argv[0] 区分真正的守护进程，否则会误判并触发多余的重启。
+ts_daemon_count() {
+	local p n=0 a0
+	for p in $(pidof tailscaled 2>/dev/null); do
+		a0="$(tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | head -n 1)"
+		case "$a0" in
+			*/tailscaled|tailscaled) n=$((n + 1)) ;;
+		esac
+	done
+	printf '%s' "$n"
+}
+
+ts_restart_once() {
+	local init="$1" n i
+	TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1
+	i=0
+	while [ "$i" -lt 3 ]; do
+		n="$(ts_daemon_count)"
+		[ "$n" -le 1 ] && return 0
+		TS_STOP_KEEP_CONFIG=1 "$init" stop >/dev/null 2>&1
+		sleep 2
+		TS_STOP_KEEP_CONFIG=1 "$init" start >/dev/null 2>&1
+		i=$((i + 1))
+	done
+	return 0
+}
+
+# 原子替换二进制：原地 `cat > 目标` 会在写入期间暴露半截的 8.5MB 文件，
+# 此时任何并发启动都会立刻崩溃并触发 respawn 风暴。
+ts_put_binary() {
+	local src="$1" bin="$2" tmp="$2/.tailscaled.new"
+	[ -s "$src" ] || return 1
+	rm -f "$tmp"
+	cat "$src" >"$tmp" || { rm -f "$tmp"; return 1; }
+	chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
+	sync
+	mv -f "$tmp" "$bin/tailscaled" || { rm -f "$tmp"; return 1; }
+	ln -sf tailscale "$bin/tailscale" || return 1
+	return 0
+}
+
+ts_kill_daemons() {
+	local p
+	for p in $(ps w 2>/dev/null | awk '/[w]rapper\.sh/ {print $1}'); do
+		kill -9 "$p" 2>/dev/null
+	done
+	for p in $(pidof tailscaled 2>/dev/null); do
+		kill -9 "$p" 2>/dev/null
+	done
+	sleep 1
+}
+
+ts_cleanup_stale_dirs() {
+	local bin="$1" keep="$2" d
+	for d in "$bin"/.tailscale-stage-* "$bin"/.tailscale-update-*; do
+		[ -d "$d" ] || continue
+		case "$d" in
+			*"-$keep") continue ;;
+		esac
+		rm -rf "$d" 2>/dev/null
+	done
+}
+
+ts_mem_avail_kb() {
+	awk '/^MemAvailable/{print $2; exit}' /proc/meminfo 2>/dev/null
+}
+
+ts_drop_caches() {
+	sync 2>/dev/null
+	echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+}
+
 ts_router_model() {
 	local model
 	model="$(cat /tmp/sysinfo/model 2>/dev/null)"
@@ -638,24 +851,65 @@ core_member_bytes() {
 }
 
 core_tryrun() {
-	if command -v timeout >/dev/null 2>&1; then
-		timeout "$TS_DEF_TRYRUN" "$1" -version >/dev/null 2>&1
-	else
-		"$1" -version >/dev/null 2>&1
-	fi
+	# 不再启动新二进制：这台设备上一次 Go 程序启动 = 4.7 秒 / 20MB RSS，
+	# 且恰好发生在 tailscaled 仍在运行、内存最紧的时刻。
+	# 改为文件级校验：ELF 魔数 + 字节序 + e_machine 架构匹配，
+	# 坏包 / 错架构包在停止服务之前就会被拦下（失败走 tryrun_fail 回滚）。
+	local hdr magic endian b1 b2 mach want
+	hdr="$(dd if="$1" bs=20 count=1 2>/dev/null | hexdump -v -e "/1 \"%02x\"" | tr -d "\n")"
+	[ -n "$hdr" ] || return 1
+	magic="$(printf '%s' "$hdr" | cut -c1-8)"
+	[ "$magic" = "7f454c46" ] || return 1
+	[ -n "$TS_ARCH" ] || return 0
+	endian="$(printf '%s' "$hdr" | cut -c11-12)"
+	b1="$(printf '%s' "$hdr" | cut -c37-38)"
+	b2="$(printf '%s' "$hdr" | cut -c39-40)"
+	case "$endian" in
+		01) mach=$(( 0x$b1 + 256 * 0x$b2 )) ;;
+		02) mach=$(( 0x$b2 + 256 * 0x$b1 )) ;;
+		*) return 0 ;;
+	esac
+	case "$TS_ARCH" in
+		*mips*|*MIPS*)     want=8 ;;
+		*arm64*|*aarch64*) want=183 ;;
+		*arm*)             want=40 ;;
+		*amd64*|*x86_64*)  want=62 ;;
+		*386*|*i686*)      want=3 ;;
+		*riscv64*)         want=243 ;;
+		*loong64*)         want=258 ;;
+		*ppc64le*)         want=21 ;;
+		*s390x*)           want=22 ;;
+		*) return 0 ;;
+	esac
+	[ "$mach" = "$want" ] || return 1
+	return 0
 }
 
+# 已安装版本：优先读缓存，避免每次都启动 8.5MB 的 Go 二进制（4.7 秒 / 20MB 峰值）。
+# 缓存比二进制旧时（升级或回滚后）自动失效。
 core_installed_version() {
-	local bin version
+	local bin cache binm cachem version
 	bin="$(ts_uci_get main bin_dir "$TS_DEF_BIN")"
 	if [ ! -x "$bin/tailscale" ]; then
 		return 1
 	fi
-	version="$("$bin/tailscale" version 2>/dev/null | head -n 1)"
+	cache="$(ts_tmpdir)/version.cache"
+	# 注意：本机 BusyBox 没有 stat 命令，只能用 test -nt 比较（缓存不比二进制旧即命中）
+	if [ -s "$cache" ] && [ ! "$bin/tailscaled" -nt "$cache" ]; then
+		version="$(head -n 1 "$cache" 2>/dev/null)"
+		if [ -n "$version" ]; then
+			ts_ver_norm "$version"
+			return 0
+		fi
+	fi
+	version="$(ts_run_timeout 15 "$bin/tailscale" version 2>/dev/null | head -n 1)"
 	if [ -z "$version" ]; then
 		return 1
 	fi
-	ts_ver_norm "$version"
+	version="$(ts_ver_norm "$version")"
+	[ -n "$version" ] || return 1
+	printf '%s\n' "$version" >"$cache" 2>/dev/null
+	printf '%s' "$version"
 }
 
 ts_extract_version() {
@@ -667,30 +921,41 @@ ts_version_matches() {
 	[ -z "$expected" ] || [ "$expected" = "latest" ] || [ "$(ts_ver_norm "$actual")" = "$(ts_ver_norm "$expected")" ]
 }
 
+# 二进制校验：只做文件级检查，不启动二进制。
+# 原来每次校验都要起一个 Go 进程（4.7 秒 / 20MB），而在 242MB 设备上
+# "为了校验而启动进程"本身就是崩溃诱因；文件刚由本脚本 mv 就位，启动校验没有增量价值。
 core_binary_version_ok() {
-	local bin="$1" expected="$2" cli_output daemon_output cli_version daemon_version
+	local bin="$1" expected="$2" sz
 	[ -x "$bin/tailscale" ] && [ -x "$bin/tailscaled" ] || return 1
-	cli_output="$("$bin/tailscale" version 2>/dev/null)" || return 1
-	daemon_output="$("$bin/tailscaled" --version 2>&1)" || return 1
-	cli_version="$(ts_extract_version "$cli_output")"
-	daemon_version="$(ts_extract_version "$daemon_output")"
-	[ -n "$cli_version" ] && [ -n "$daemon_version" ] || return 1
-	ts_version_matches "$expected" "$cli_version" && ts_version_matches "$expected" "$daemon_version"
+	sz="$(ts_path_bytes "$bin/tailscaled")"
+	case "$sz" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$sz" -gt 1048576 ] || return 1
+	return 0
 }
 
+# 零 CLI 就绪判定：进程 + socket + TUN 接口三者齐备。
+# 本机实测：任何一次 tailscale/tailscaled 二进制启动都要 4.6~4.9 秒（闪存加载 8.5MB Go 二进制）
+# 且峰值 20MB+；轮询调用必然把 242MB 内存打穿。故此处不启动任何 tailscale 进程。
 core_service_ready() {
-	local bin="$1" expected="$2" socket="$3" output reported
-	if command -v timeout >/dev/null 2>&1; then
-		output="$(timeout 2 "$bin/tailscale" "--socket=$socket" status --json 2>/dev/null)" || return 1
-	else
-		output="$("$bin/tailscale" "--socket=$socket" status --json 2>/dev/null)" || return 1
-	fi
-	printf '%s' "$output" | grep -q '"BackendState"[[:space:]]*:' || return 1
-	reported="$(printf '%s' "$output" | grep -Eo -m1 '"Version"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d '"' -f4)"
-	if [ -n "$expected" ] && [ "$expected" != "latest" ] && [ -n "$reported" ]; then
-		reported="$(ts_extract_version "$reported")"
-		[ -n "$reported" ] && ts_version_matches "$expected" "$reported" || return 1
-	fi
+	local bin="$1" socket="$3"
+	[ -x "$bin/tailscaled" ] || return 1
+	pidof tailscaled >/dev/null 2>&1 || return 1
+	[ -S "$socket" ] || return 1
+	ip link show tailscale0 >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# 就绪后只做一次真正的 API 确认，失败仅告警（不再循环重试）
+ts_verify_api() {
+	local id="$1" bin="$2" socket="$3" out
+	# 默认关闭：这次调用正好落在 tailscaled 刚启动、内存最紧的时刻，
+	# 而这台设备上一次 status 要 4.7 秒 / 20MB。需要时用 uci set tailscale.update.verify_api=1 打开。
+	[ "$(ts_uci_get update verify_api '0')" = "1" ] || return 0
+	out="$(ts_run_timeout 10 "$bin/tailscale" "--socket=$socket" status 2>/dev/null)" || {
+		ts_task_log "$id" api_verify 'status did not answer in 10s'
+		return 0
+	}
+	[ -n "$out" ] || ts_task_log "$id" api_verify 'empty status output'
 	return 0
 }
 
@@ -708,27 +973,39 @@ ts_service_wait_seconds() {
 }
 
 ts_wait_service() {
-	local id="$1" bin="$2" expected="$3" socket="$4" start deadline now elapsed next_log remaining wait_seconds
+	local id="$1" bin="$2" expected="$3" socket="$4" start deadline now elapsed next_log remaining wait_seconds avail
 	wait_seconds="$(ts_service_wait_seconds)"
 	start="$(date +%s)"
 	deadline=$((start + wait_seconds))
 	next_log=$((start + 15))
 	ts_task_step "$id" healthcheck 98 ''
 	while :; do
-		if core_service_ready "$bin" "$expected" "$socket"; then
-			now="$(date +%s)"
-			ts_task_log "$id" service_ready "$((now - start)) seconds"
-			return 0
-		fi
 		now="$(date +%s)"
 		[ "$now" -lt "$deadline" ] || break
+		avail="$(ts_mem_avail_kb)"
+		if [ -n "$avail" ] && [ "$avail" -lt 12288 ] 2>/dev/null; then
+			ts_task_log "$id" service_wait "low memory ${avail}kB, backing off"
+			sleep 5
+			continue
+		fi
+		if core_service_ready "$bin" "$expected" "$socket"; then
+			ts_task_log "$id" service_ready "$((now - start)) seconds"
+			ts_verify_api "$id" "$bin" "$socket"
+			return 0
+		fi
 		elapsed=$((now - start))
 		if [ "$now" -ge "$next_log" ]; then
 			ts_task_log "$id" service_wait "$elapsed/$wait_seconds seconds"
 			next_log=$((now + 15))
 		fi
 		remaining=$((deadline - now))
-		if [ "$remaining" -lt 1 ]; then sleep "$remaining"; else sleep 1; fi
+		if [ "$remaining" -lt 1 ]; then
+			sleep 1
+		elif [ "$remaining" -lt 4 ]; then
+			sleep "$remaining"
+		else
+			sleep 4
+		fi
 	done
 	return 1
 }
@@ -891,6 +1168,7 @@ core_cli_running() {
 
 core_stop_for_update() {
 	local init="$1" timeout="${2:-30}" waited=0
+	ts_drop_caches
 	if ts_running; then
 		TS_STOP_KEEP_CONFIG=1 TS_STOP_RELOAD_NETWORK=0 TS_STOP_SKIP_WORKER=1 "$init" stop >/dev/null 2>&1 || :
 	fi
@@ -1019,20 +1297,20 @@ core_manual_install() {
 	if [ -z "$result" ]; then
 		ts_task_step "$id" install 84 ""
 		changed=1
-		if ! cat "$stage" > "$bin/tailscaled" || ! chmod 755 "$bin/tailscaled" || ! ln -sf tailscaled "$bin/tailscale"; then
+		if ! ts_put_binary "$stage" "$bin"; then
 			result='install_fail'
 		fi
 	fi
 	if [ -z "$result" ]; then
 		ts_task_step "$id" restart 92 ""
-		TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+		ts_restart_once "$init"
 	fi
 	if [ -n "$result" ] && [ "$changed" = 1 ] && [ "$backup_ok" = 1 ]; then
 		if ! core_stop_for_update "$init" 30; then
 			result='rollback_fail'
-		elif cat "$backup" > "$bin/tailscaled" && chmod 755 "$bin/tailscaled" && ln -sf tailscaled "$bin/tailscale"; then
+		elif ts_put_binary "$backup" "$bin"; then
 			result='rolled_back'
-			TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+			ts_restart_once "$init"
 		else
 			result='rollback_fail'
 		fi
@@ -1041,7 +1319,7 @@ core_manual_install() {
 		ln -sf tailscaled "$bin/tailscale" || result='rollback_fail'
 	fi
 	if [ -n "$result" ] && [ "$changed" = 0 ] && [ "$was_running" = 1 ] && ! ts_running; then
-		TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+		ts_restart_once "$init"
 	fi
 	core_finish "$id" "$result"
 	core_manual_cleanup "$id"
@@ -1124,7 +1402,7 @@ core_rollback() {
 	ts_task_log "$id" update_failed "$cause"
 	if ! core_stop_for_update "$init" 30; then
 		if [ "$was_running" = "1" ] && ! ts_running; then
-			TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+			ts_restart_once "$init"
 		fi
 		ts_task_log "$id" rollback_fail 'service did not stop before restoring binaries'
 		core_finish "$id" rollback_fail
@@ -1143,7 +1421,7 @@ core_rollback() {
 	if [ "$was_running" = "1" ]; then
 		socket="$(ts_uci_get main socket "$TS_DEF_SOCKET")"
 		ts_task_step "$id" restart 99 ''
-		TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+		ts_restart_once "$init"
 		if ! ts_wait_service "$id" "$bin" "$old_version" "$socket"; then
 			ts_task_log "$id" rollback_fail 'service did not recover after restoration'
 			core_finish "$id" rollback_fail
@@ -1163,7 +1441,7 @@ core_update_failure() {
 		return 1
 	fi
 	if [ "$was_running" = "1" ] && ! ts_running; then
-		TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+		ts_restart_once "$init"
 	fi
 	ts_task_log "$id" update_failed "$cause"
 	core_finish "$id" update_fail_no_rollback
@@ -1175,6 +1453,8 @@ core_install() {
 	dir="$(ts_tmpdir)"
 	bin="$(ts_uci_get main bin_dir "$TS_DEF_BIN")"
 	init="${TS_SELF_INIT:-/etc/init.d/tailscale}"
+	ts_drop_caches
+	ts_cleanup_stale_dirs "$bin" "$id"
 	mkdir -p "$bin" 2>/dev/null
 	ts_task_begin "$id"
 	if ! ts_lock "$dir/download"; then
@@ -1192,7 +1472,7 @@ core_install() {
 		return 1
 	fi
 	ts_task_step "$id" install 90 ""
-	old_version="$(core_installed_version)" || old_version=''
+	old_version="$(head -n 1 "$dir/version.cache" 2>/dev/null)" || old_version=''
 	had_daemon=0
 	[ -f "$bin/tailscaled" ] && had_daemon=1
 	had_cli=0
@@ -1235,15 +1515,21 @@ core_install() {
 		return 1
 	fi
 	expected_version="$version"
+	# latest 需要在下面"服务已停止、内存最宽裕"时再探测，避免和运行中的服务抢内存
 	if [ "$expected_version" = "latest" ]; then
-		expected_version="$(ts_extract_version "$("$new" --version 2>&1)")"
+		expected_version=''
 	fi
+	ts_guard_arm "$init" "$was_running"
+	ts_relief_arm
 	if [ "$was_running" = "1" ]; then
 		ts_task_step "$id" stop 92 ""
 	fi
+	if [ -z "$expected_version" ]; then
+		expected_version="$(ts_extract_version "$("$new" --version 2>&1)")"
+	fi
 	if ! core_stop_for_update "$init" 30; then
 		if [ "$was_running" = "1" ] && ! ts_running; then
-			TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+			ts_restart_once "$init"
 		fi
 		core_remove_backups "$backup_dir"
 		core_finish "$id" service_stop_fail
@@ -1264,15 +1550,23 @@ core_install() {
 	if [ -z "$expected_version" ]; then
 		expected_version="$(core_installed_version)" || expected_version=''
 	fi
+	if [ -n "$expected_version" ]; then
+		printf '%s\n' "$expected_version" >"$dir/version.cache" 2>/dev/null
+	fi
 	if ! core_binary_version_ok "$bin" "$expected_version"; then
 		core_update_failure "$id" "$bin" "$init" "$backup_dir" "$had_daemon" "$had_cli" "$cli_link" "$was_running" version_check_fail "$old_version"
 		return 1
 	fi
 	ts_task_step "$id" install 95 ""
+	if [ -n "$TS_RELIEF_STOPPED" ]; then
+		ts_relief_restore
+	fi
 	if [ "$was_running" = "1" ]; then
 		ts_task_step "$id" restart 97 ""
 		socket="$(ts_uci_get main socket "$TS_DEF_SOCKET")"
-		TS_STOP_KEEP_CONFIG=1 "$init" restart >/dev/null 2>&1 &
+		# 启动前丢 page cache：新二进制刚写完，缓存里还压着 8~10MB，丢掉只是少读一次盘
+		ts_drop_caches
+		ts_restart_once "$init"
 		if ! ts_wait_service "$id" "$bin" "$expected_version" "$socket"; then
 			core_update_failure "$id" "$bin" "$init" "$backup_dir" "$had_daemon" "$had_cli" "$cli_link" "$was_running" restart_fail "$old_version"
 			return 1
@@ -1288,6 +1582,7 @@ official_install() {
 	dir="$(ts_tmpdir)"
 	bin="$(ts_uci_get main bin_dir "$TS_DEF_BIN")"
 	init="${TS_SELF_INIT:-/etc/init.d/tailscale}"
+	ts_drop_caches
 	latest="$(ts_official_latest)" || {
 		ts_task_begin "$id"
 		ts_task_done "$id" fetch_fail
@@ -1940,7 +2235,15 @@ update_installed() {
 }
 
 update_download() {
-	local proj="$1" id="$2" version="$3" file="$4" source="$5" arch="$6"
+	local proj="$1" id="$2" version="$3" file="$4" source="$5" arch="$6" lockbase rc quiet
+	lockbase="$(ts_tmpdir)/install"
+	if ! ts_lock "$lockbase"; then
+		return 1
+	fi
+	# 更新窗口静默标记：LuCI 的 rpcd 看到它就不再拉起任何 tailscale 进程
+	# （本机一次 status 要 4.7 秒 / 20MB，正好撞在 tailscaled 重启的内存峰值上）
+	quiet="$(ts_tmpdir)/quiet"
+	date +%s >"$quiet" 2>/dev/null
 	case "$proj" in
 		tailscale)
 			if [ "$source" = official ]; then
@@ -1950,8 +2253,14 @@ update_download() {
 			fi
 			;;
 		luci-app-tailscale) luci_install "$id" "$version" "$file" "$source" ;;
-		*) return 2 ;;
+		*) ts_unlock "$lockbase"; return 2 ;;
 	esac
+	rc=$?
+	rm -f "$quiet" 2>/dev/null
+	# 更新收尾：后台刷一次快照，LuCI 页面立即可见新版本与节点状态
+	( sleep 3; /usr/libexec/rpcd/tailscale refresh >/dev/null 2>&1 & )
+	ts_unlock "$lockbase"
+	return "$rc"
 }
 
 
