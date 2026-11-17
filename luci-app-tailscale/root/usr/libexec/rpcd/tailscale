@@ -11,8 +11,49 @@ const WL = {
 
 const SOCKET_WAITS = 5;
 const UP_TIMEOUT = 600;
-const STATUS_REFRESH_INTERVAL = 5;
+const STATUS_REFRESH_INTERVAL = 30;
 const STATUS_REFRESH_LOCK_MAX_AGE = 60;
+
+// 这台设备（MT7621 / 242MB）上任何一次 tailscale 二进制启动都要 4.6~4.9 秒、
+// 峰值 20MB+；一旦在内存紧张时启动就会被 OOM 杀掉，随即重试，形成死亡螺旋。
+// 因此统一加内存门槛：低于该值时一律不启动进程，直接返回缓存快照。
+const REFRESH_MIN_MEM_KB = 51200;
+
+function memAvailKb() {
+	let txt = null;
+	try { txt = readfile('/proc/meminfo'); } catch (e) { return null; }
+	if (txt == null) return null;
+	for (let ln in split(txt, '\n')) {
+		if (substr(ln, 0, 12) != 'MemAvailable') continue;
+		for (let tok in split(trim(ln), ' ')) {
+			let v = int(tok);
+			if (v > 0) return v;
+		}
+	}
+	return null;
+}
+
+// 更新窗口标记：update.sh 在更新开始时创建、结束时删除。
+// 用它判定比解析任务 JSON 更可靠，且不依赖本机 BusyBox 缺失的 stat 命令。
+function quietActive() {
+	// 本机 ucode 里 stat() 在函数作用域内返回值不可靠（实测恒为 null），
+	// 会让整个内存守卫静默失效，这里改用 readfile 读时间戳。
+	let raw = null;
+	try { raw = readfile(tmpdir() + '/quiet'); } catch (e) { raw = null; }
+	if (raw == null) return false;
+	let v = int(trim(raw)) || 0;
+	if (v < 1) return true;
+	let now = int(clock()[0]) || 0;
+	let age = now - v;
+	return (age >= -30 && age < 900);
+}
+
+// true = 现在不允许启动 tailscale 进程
+function refreshBlocked() {
+	if (quietActive()) return true;
+	let a = memAvailKb();
+	return (a != null && a < REFRESH_MIN_MEM_KB);
+}
 
 function getenv2(k, dflt) {
 	let v = getenv(k);
@@ -440,7 +481,38 @@ function setConfig(p) {
 	return { ok: true, applied: cleared, deferred: !cleared, fallback_auto: true, derp_preferred_region: '0' };
 }
 
-function buildStatus(p) {
+// 当前版本：优先读 update.sh / 本函数写下的缓存文件，读不到才启动 CLI（且受内存门槛约束）
+function cachedVersion(bin) {
+	let cp = tmpdir() + '/version.cache';
+	let txt = null;
+	try { txt = readfile(cp); } catch (e) { txt = null; }
+	if (txt != null && trim(txt) != '') return trim(txt);
+	if (refreshBlocked()) return '';
+	// 与 buildStatus 共用 cli.lock：任何时刻只允许一个 tailscale CLI 进程
+	let _lk = tmpdir() + '/cli.lock', _ts = int(clock()[0]) || 0, _got = false;
+	sh('mkdir -p ' + sq(tmpdir()) + ' 2>/dev/null');
+	if (sh('mkdir ' + sq(_lk) + ' 2>/dev/null').rc == 0) {
+		_got = true;
+	} else {
+		let _t = null;
+		try { _t = readfile(_lk + '/t'); } catch (e) { _t = null; }
+		let _b = _t != null ? (int(trim(_t)) || 0) : 0;
+		if (_b > 0 && _ts - _b < 25) return '';
+		sh('rm -rf ' + sq(_lk) + ' 2>/dev/null');
+		if (sh('mkdir ' + sq(_lk) + ' 2>/dev/null').rc == 0) _got = true;
+	}
+	if (!_got) return '';
+	let v = sh(sq(bin + '/tailscale') + ' version 2>/dev/null');
+	sh('rm -rf ' + sq(_lk) + ' 2>/dev/null');
+	if (v.rc != 0) return '';
+	let vl = split(trim(v.out), '\n');
+	if (length(vl) < 1) return '';
+	let ver = trim(vl[0]);
+	if (ver != '') { try { writefile(cp, ver + '\n'); } catch (e) {} }
+	return ver;
+}
+
+function buildStatus(p, light) {
 	let bin = bindir();
 	let channel = cfg('update', 'channel', 'custom');
 	let rollback = cfg('update', 'auto_rollback', '1');
@@ -454,18 +526,34 @@ function buildStatus(p) {
 	res.tailscaled_ok = sh('test -x ' + sq(bin + '/tailscaled') + ' 2>/dev/null').rc == 0;
 	res.tailscale_cli_ok = sh('test -x ' + sq(bin + '/tailscale') + ' 2>/dev/null').rc == 0;
 	res.binary_ok = res.tailscaled_ok && res.tailscale_cli_ok;
-	if (res.tailscale_cli_ok) {
-		let v = sh(sq(bin + '/tailscale') + ' version 2>/dev/null');
-		if (v.rc == 0) {
-			let vl = split(trim(v.out), '\n');
-			if (length(vl) > 0) res.version = trim(vl[0]);
+	if (res.tailscale_cli_ok && !light) res.version = cachedVersion(bin);
+	// CLI 单飞：一次 4.7s，前端 1.5s 轮询；没有这个锁进程必然堆叠。
+	// 用局部闭包实现，避免再往本文件的全局符号表里加东西。
+	let _cli_lock = function() {
+		let tmp = tmpdir(), lk = tmp + '/cli.lock', ts = int(clock()[0]) || 0;
+		sh('mkdir -p ' + sq(tmp) + ' 2>/dev/null');
+		if (sh('mkdir ' + sq(lk) + ' 2>/dev/null').rc == 0) {
+			try { writefile(lk + '/t', '' + ts); } catch (e) {}
+			return true;
+		}
+		let txt = null;
+		try { txt = readfile(lk + '/t'); } catch (e) { txt = null; }
+		let began = txt != null ? (int(trim(txt)) || 0) : 0;
+		if (began > 0 && ts - began < 25) return false;
+		sh('rm -rf ' + sq(lk) + ' 2>/dev/null');
+		if (sh('mkdir ' + sq(lk) + ' 2>/dev/null').rc != 0) return false;
+		try { writefile(lk + '/t', '' + ts); } catch (e) {}
+		return true;
+	};
+	let st = null;
+	if (!light && !refreshBlocked() && _cli_lock()) {
+		let s = sh_bounded(sq(bin + '/tailscale') + ' --socket=' + sq(sockpath()) + ' status --json 2>/dev/null', 8);
+		sh('rm -rf ' + sq(tmpdir() + '/cli.lock') + ' 2>/dev/null');
+		if (s.rc == 0) {
+			try { st = json(s.out); } catch (e) { st = null; }
 		}
 	}
-	let s = sh_bounded(sq(bin + '/tailscale') + ' --socket=' + sq(sockpath()) + ' status --json 2>/dev/null', 8);
-	let st = null;
-	if (s.rc == 0) {
-		try { st = json(s.out); } catch (e) { st = null; }
-	}
+	res.cli_ok = (st != null);
 	if (st != null) {
 		res.running = true;
 		if (st.BackendState != null) res.backend_state = '' + st.BackendState;
@@ -739,6 +827,7 @@ function status_snapshot_result(snapshot) {
 }
 
 function start_status_refresh() {
+	if (refreshBlocked()) return false;
 	let td = tmpdir(), lock = status_refresh_lock(), now = int(clock()[0]) || 0;
 	let started = null, lockExists = false, lockText = null;
 	try { lockText = readfile(lock + '/started'); } catch (e) { lockText = null; }
@@ -777,8 +866,16 @@ function start_status_refresh() {
 function getStatus(p) {
 	let force = p.force_refresh == true || p.force_refresh == 1 || p.force_refresh == '1';
 	let withDerp = p.include_derp_map == true || p.include_derp_map == 1 || p.include_derp_map == '1';
-	if (force || withDerp) {
+	if ((force || withDerp) && !refreshBlocked()) {
 		let status = buildStatus(p);
+		if (status.cli_ok !== true) {
+			let prev = read_status_snapshot();
+			if (prev != null) {
+				let keep = status_snapshot_result(prev);
+				keep.pending_refresh = true;
+				return keep;
+			}
+		}
 		let at = write_status_snapshot(status);
 		status.status_updated_at = at > 0 ? at : (int(clock()[0]) || 0);
 		status.status_age_seconds = 0;
@@ -786,10 +883,13 @@ function getStatus(p) {
 	}
 	let snapshot = read_status_snapshot();
 	if (snapshot == null) {
-		let status = buildStatus(p);
-		let at = write_status_snapshot(status);
-		status.status_updated_at = at > 0 ? at : (int(clock()[0]) || 0);
+		// 冷启动 / 快照被清空：只做零-CLI 的轻量采集，重活交给后台刷新。
+		// 否则前端每 1.5s 一次的轮询会各自 fork 一个 4.7s 的 CLI。
+		start_status_refresh();
+		let status = buildStatus(p, true);
+		status.status_updated_at = 0;
 		status.status_age_seconds = 0;
+		status.pending_refresh = true;
 		return status;
 	}
 	let now = int(clock()[0]) || snapshot.at;
@@ -1633,6 +1733,22 @@ function diag(p) {
 
 const DISPATCH = { getStatus: getStatus, getConfig: getConfig, setConfig: setConfig, getSources: getSources, getVersionFiles: getVersionFiles, refreshSources: refreshSources, resolveFile: resolveFile, getFileSize: getFileSize, download: download, progress: progress, cancelTask: cancelTask, beginManualUpload: beginManualUpload, finishManualUpload: finishManualUpload, applyNetwork: applyNetwork, applyCron: applyCron, getLogin: getLogin, logout: logout, reauth: reauth, applyUp: applyUp, pingPeers: pingPeers, serviceAction: serviceAction, getLogs: getLogs, clearLogs: clearLogs, removeCore: removeCore, diag: diag };
 
+if (ARGV[0] == 'refresh') {
+	// 供开机预热（/usr/lib/ts-warm.sh）与更新收尾调用：同步刷一次快照。
+	// 静默期（更新窗口）或内存过低时拒绝，避免与更新流程抢资源。
+	if (refreshBlocked()) {
+		printf('%J\n', { ok: false, reason: 'blocked' });
+		exit(0);
+	}
+	let res = buildStatus({});
+	if (res.cli_ok !== true) {
+		printf('%J\n', { ok: false, reason: 'cli' });
+		exit(0);
+	}
+	let at = write_status_snapshot(res);
+	printf('%J\n', { ok: true, at: at });
+	exit(0);
+}
 if (ARGV[0] == 'list') {
 	let t = {};
 	for (let k in DISPATCH) t[k] = {};
