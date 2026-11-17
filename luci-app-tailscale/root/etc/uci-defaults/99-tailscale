@@ -8,5 +8,18 @@ uci -q commit firewall
 [ -x /etc/init.d/tailscale ] || exit 0
 /etc/init.d/tailscale enable
 
+# 开机状态预热：默认启用。幂等注入 /etc/rc.local（防重复），脚本自身也有
+# 30 分钟快照幂等保护；如需关闭，删除 rc.local 中的 warm-status.sh 行即可。
+if [ -x /usr/libexec/tailscale/warm-status.sh ]; then
+	mkdir -p /etc 2>/dev/null
+	if grep -q 'warm-status.sh' /etc/rc.local 2>/dev/null; then
+		:
+	else
+		sed -i '/^exit 0/i\( sh /usr/libexec/tailscale/warm-status.sh >/dev/null 2>&1 & )' /etc/rc.local 2>/dev/null || {
+			printf '( sh /usr/libexec/tailscale/warm-status.sh >/dev/null 2>&1 & )\n' >> /etc/rc.local 2>/dev/null
+		}
+	fi
+fi
+
 exit 0
 
