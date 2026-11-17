@@ -35,7 +35,7 @@ const callDiag = rpc.declare({ object: 'tailscale', method: 'diag' });
 const STATUS_CACHE_KEY = 'tailscale-status-v2';
 const STATUS_AUTH_KEY = 'tailscale-auth-v1';
 const STATUS_CACHE_TTL = 10000;
-const STATUS_POLL_INTERVAL = 1500;
+const STATUS_POLL_INTERVAL = 5000;
 let activeRoot = null, statusCache = null, statusCacheAt = 0, statusRequest = null, statusRequestFresh = false, statusTimer = null, statusTickTimer = null, statusPollRoot = null, badgeRestarting = false;
 const statusSubscribers = [];
 const ACTION_THEME_VARS = ['--text', '--muted', '--accent', '--accent-soft', '--edge', '--hi', '--glass', '--glass2', '--shadow'];
